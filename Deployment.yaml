@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: psql-database-secret
+  namespace: zip-java-main-9c2250f 
+type: Opaque
+data:
+  dbuser: BASE64_ENCODED_VALUE
+  dbpass: BASE64_ENCODED_VALUE
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: metric-registry-gtw-service #gRPC GATEWAY SERVICE - EXPOSES REST API AND COMMUNICATES WITH gRPC SERVER
+  namespace: zip-java-main-9c2250f
+  annotations:
+    networking.knative.dev/ingress-class: zip-java-dev #NEEDS TO POINT TO ACTUAL INGRESS CLASS
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1" #THIS MAKES SURE THE SERVICE DOESN'T SCALE TO 0. IF ONLY THERE WAS A WAY TO BOOST COLD START TIMES ( ͡°( ͡° ͜ʖ( ͡° ͜ʖ ͡°)ʖ ͡°) ͡°)
+        autoscaling.knative.dev/targetUtilizationPercentage: "50"
+    spec:
+      containers:
+      - image: iotwzipacr.azurecr.io/nio/metric-registry-grpc-gtw:main-df327237795331f91c2611fe476f216ac0c31f24
+        imagePullPolicy: Always
+        env:
+          - name: METRIC_REGISTRY_GTW_GRPC_SERVER_ENDPOINT
+            value: metric-registry-grpc-service.zip-java-main-9c2250f.svc.cluster.local:80 #KNATIVE EXPOSES WORKLOADS EXTERNALLY ON PORTS 80 AND 443 (YES, EVEN THE GRPC, BUT IT'S HTTP/2 SO IT'S ALRIGHT)
+          - name: METRIC_REGISTRY_GTW_PORT
+            value: "8080"
+        ports:
+          - containerPort: 8080
+      imagePullSecrets:
+      - name: dockercred
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: metric-registry-grpc-service #ACTUAL gRPC SERVER
+  namespace: zip-java-main-9c2250f
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1" #THIS MAKES SURE THE SERVICE DOESN'T SCALE TO 0. IF ONLY THERE WAS A WAY TO BOOST COLD START TIMES ( ͡°( ͡° ͜ʖ( ͡° ͜ʖ ͡°)ʖ ͡°) ͡°)
+        autoscaling.knative.dev/targetUtilizationPercentage: "50"
+    spec:
+      containers:
+      - image: iotwzipacr.azurecr.io/metric-registry:ZIP-1545-30a0f9a641d414617e286ab66b3d3cc443b54458
+        imagePullPolicy: Always
+        env:
+          - name: APP_PORT
+            value: "8081"
+          - name: METRIC_REGISTRY_SERVICE_DB_ADDR
+            value: niojavadevpgserver.postgres.database.azure.com:5432 # THIS CAN ALSO BE MOUNT FROM SECRET
+          - name: METRIC_REGISTRY_SERVICE_DB_NAME
+            value: niopgdev
+          - name: METRIC_REGISTRY_SERVICE_DB_USER
+            valueFrom:
+              secretKeyRef:
+                name: psql-database-secret
+                key: dbuser #WE MOUNT CREDENTIALS FROM SECRETS
+          - name: METRIC_REGISTRY_SERVICE_DB_PWD
+            valueFrom:
+              secretKeyRef:
+                name: psql-database-secret
+                key: dbpass #WE MOUNT CREDENTIALS FROM SECRETS
+        ports:
+          - name: h2c #h2c IS A STANDARD PORT NAME FOR GRPC WORKLOADS
+            containerPort: 8081
+      imagePullSecrets:
+      - name: dockercred
+---
+apiVersion: configuration.konghq.com/v1
+config:
+  add:
+    headers:
+    - 'Host: metric-registry-gtw-service.zip-java-main-9c2250f.svc.cluster.local' #THIS IS NORMALLY FILLED DYNAMICALLY - REFER TO HELM CHART REPO. WE EXPOSE HTTP VIA INGRESS SO WE POINT IT TO GATEWAY.
+  replace:
+    headers:
+    - 'Host: metric-registry-gtw-service.zip-java-main-9c2250f.svc.cluster.local' #THIS IS NORMALLY FILLED DYNAMICALLY - REFER TO HELM CHART REPO. WE EXPOSE HTTP VIA INGRESS SO WE POINT IT TO GATEWAY.
+kind: KongPlugin
+metadata:
+  name: metric-registry-gtw-service-host-rewrite-plugin
+  namespace: kong-java
+plugin: request-transformer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    konghq.com/plugins: metric-registry-gtw-service-host-rewrite-plugin, zip-645-service-cors-plugin
+    konghq.com/strip-path: "true"
+  name: metric-registry-gtw-service-ingress
+  namespace: kong-java
+spec:
+  ingressClassName: zip-java-dev
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: zip-645-kong-proxy #THIS NEEDS to use actual service proxy name in the provided namespace
+            port:
+              number: 80
+        path: /metric-registry/ #THIS WILL BE A SERVING PATH. YOU NEED TO RUN A MAKEFILE SCRIPT IN GATEWAY REPO WHEN CHANGED
+        pathType: ImplementationSpecific
